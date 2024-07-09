@@ -11,7 +11,7 @@ namespace utils {
 Tensor init_attention_mask(const Tensor& input_ids) {
     auto shape = input_ids.get_shape();
     auto attention_mask = ov::Tensor{input_ids.get_element_type(), shape};
-    std::fill_n(attention_mask.data<int64_t>(), shape[0] * shape[1], 1);
+    std::fill_n(attention_mask.data<ov::float16>(), shape[0] * shape[1], 1);
     return attention_mask;
 }
 
@@ -41,10 +41,10 @@ int64_t argmax(const ov::Tensor& logits, const size_t batch_idx) {
     size_t vocab_size = logits.get_shape().back();
     size_t batch_offset = batch_idx * logits.get_shape()[1] * vocab_size;
     size_t sequence_offset = (logits.get_shape()[1] - 1) * vocab_size;
-    const float* logits_data = logits.data<const float>() + batch_offset + sequence_offset;
+    const ov::float16* logits_data = logits.data<ov::float16>() + batch_offset + sequence_offset;
     
     int64_t out_token = std::max_element(logits_data, logits_data + vocab_size) - logits_data;
-    float max_logit = logits_data[out_token];
+    ov::float16 max_logit = logits_data[out_token];
 
     return out_token;
 }
