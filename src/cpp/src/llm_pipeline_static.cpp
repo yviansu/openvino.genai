@@ -319,14 +319,12 @@ EncodedResults StaticLLMPipeline::generate(
 
     auto first_token_time = Time::now();
     const size_t max_tokens = config.get_max_new_tokens(prompt_len);
-    int token_count = 0;
 
     for (int i = prompt_len; i < max_tokens; ++i) {
         m_kvcache_request.infer();
   
         last_token = 0;
         results.tokens[0].push_back((int64_t)last_token);
-        token_count++;
 
         if (streamer_ptr && streamer_ptr->put(last_token)) {
             break;
@@ -338,12 +336,14 @@ EncodedResults StaticLLMPipeline::generate(
 
     }
 
+    int token_count = results.tokens[0].size();
+
     auto end_time = Time::now();
     std::cout << "Performance metrics: " << std::endl;
     std::cout << "Generated tokens: " << token_count << std::endl;
     std::cout << "First token generation time: " << get_duration_ms(start_time, first_token_time) << std::endl;
-    std::cout << "Generation average latency: " << get_duration_ms(start_time, end_time)/(token_count - 1) << std::endl;
-    std::cout << "token/s: " << (token_count - 1)/(get_duration_ms(start_time, end_time)/1000) << std::endl;
+    std::cout << "Generation average latency: " << get_duration_ms(first_token_time, end_time)/(token_count - 1) << std::endl;
+    std::cout << "token/s: " << (token_count - 1)/(get_duration_ms(first_token_time, end_time)/1000) << std::endl;
     std::cout << "Generation time: " << get_duration_ms(start_time, end_time) << std::endl;
 
     std::cout << "Tokens:\n";
