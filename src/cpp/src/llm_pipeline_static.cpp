@@ -7,8 +7,21 @@
 
 #include "text_callback_streamer.hpp"
 #include "utils.hpp"
+#include <openvino/pass/serialize.hpp>
+#include <openvino/openvino.hpp>
+#include <filesystem>
+#include <fstream>
+#include <variant>
+#include <algorithm>
+#include <nlohmann/json.hpp>
+#include <chrono>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include <openvino/pass/stateful_to_stateless.hpp>
+// #include <openvino/pass/stateful_to_stateless.hpp>
 
 namespace {
 
@@ -78,13 +91,13 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
 }
 
 void fill_tensor(ov::Tensor tensor, int64_t fill_val, size_t offset = 0u) {
-    int64_t* tensor_data = tensor.data<int64_t>();
-    std::fill(tensor_data + offset, tensor_data + tensor.get_size(), fill_val);
+    ov::float16* tensor_data = tensor.data<ov::float16>();
+    std::fill(tensor_data + offset, tensor_data + tensor.get_size(), (ov::float16)fill_val);
 }
 
 void copy_with_offset(const ov::Tensor& orig, const int32_t offset, ov::Tensor& padded) {
     int64_t* orig_data = orig.data<int64_t>();
-    int64_t* padded_data = padded.data<int64_t>();
+    ov::float16* padded_data = padded.data<ov::float16>();
     std::copy(orig_data, orig_data + orig.get_size(), padded_data + offset);
 }
 
@@ -144,29 +157,50 @@ StaticLLMPipeline::StaticLLMPipeline(
     */
     ov::Core core;
     // (1) Read the template model - this will be kvcache model
-    auto kvcache_model = core.read_model(path / "openvino_model.xml");
-    // (2) Expose KV-cache input and output layers from kvcache model
-    ov::pass::StatefulToStateless().run_on_model(kvcache_model);
-    // (3) Clone the model - this will be prefill
-    auto prefill_model = kvcache_model->clone();
-    prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
+    std::ifstream modelStream("C:\\WorkSpace\\Yihan\\models\\Phi-3\\ovmergev6\\vpuip.blob", std::ios_base::binary | std::ios_base::in);
+    if (!modelStream.is_open()) {
+        std::cout << "Cannot open kvcache blob file" << std::endl;
+    }
+    std::cout << "Use kvcache blob file" << std::endl;
+    ov::AnyMap latency{{ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY}};
+    m_kvcache_request = core.import_model(modelStream, device, latency).create_infer_request();
+    std::cout << "kvcache blob file imported on " << device << std::endl;
+    modelStream.close();
+
+    // // (1) Read the template model - this will be prefill model
+    // std::ifstream modelStream_prefill("D:\\WorkSpace\\Yihan\\models\\Phi-3\\phi3_mini_4SymW16A_scale_staticshape_eager\\phi3_mini_4SymW16A_scale_prefill_4C_nonWLM.blob", std::ios_base::binary | std::ios_base::in);
+    // if (!modelStream_prefill.is_open()) {
+    //     std::cout << "Cannot open prefill blob file" << std::endl;
+    // }
+    // std::cout << "Use prefill blob file" << std::endl;
+    // m_prefill_request = core.import_model(modelStream_prefill, device, latency).create_infer_request();
+    // std::cout << "prefill blob file imported on " << device << std::endl;
+    // modelStream_prefill.close();
+
+    // // (1) Read the template model - this will be kvcache model
+    // auto kvcache_model = core.read_model(path / "openvino_model.xml");
+    // // (2) Expose KV-cache input and output layers from kvcache model
+    // ov::pass::StatefulToStateless().run_on_model(kvcache_model);
+    // // (3) Clone the model - this will be prefill
+    // auto prefill_model = kvcache_model->clone();
+    // prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
     // (4) Reshape both models to static shape
     m_kvcache_desc = KVCacheDesc { 1024u, 0u };
     const uint32_t max_prompt_size = m_kvcache_desc.total_size;
     const uint32_t max_kvcache_size = m_kvcache_desc.total_size;
-    reshape_to_static(prefill_model, max_prompt_size, max_kvcache_size);
-    reshape_to_static(kvcache_model, 1u, max_kvcache_size);
-    // (5) Add slices to kvcache model
-    kvcache_model = add_slices_to_kvcache_inputs(kvcache_model);
-    // (6) Compile both model
-    m_prefill_request = core.compile_model(
-        prefill_model, device, extract_config_or_default(config, "PREFILL_CONFIG")
-    ).create_infer_request();
-    m_kvcache_request = core.compile_model(
-        kvcache_model, device, extract_config_or_default(config, "GENERATE_CONFIG")
-    ).create_infer_request();
+    // reshape_to_static(prefill_model, max_prompt_size, max_kvcache_size);
+    // reshape_to_static(kvcache_model, 1u, max_kvcache_size);
+    // // (5) Add slices to kvcache model
+    // kvcache_model = add_slices_to_kvcache_inputs(kvcache_model);
+    // // (6) Compile both model
+    // m_prefill_request = core.compile_model(
+    //     prefill_model, device, extract_config_or_default(config, "PREFILL_CONFIG")
+    // ).create_infer_request();
+    // m_kvcache_request = core.compile_model(
+    //     kvcache_model, device, extract_config_or_default(config, "GENERATE_CONFIG")
+    // ).create_infer_request();
     // (7) Initialize tensors
-    prepare_for_new_conversation();
+    // prepare_for_new_conversation();
 };
 
 StaticLLMPipeline::StaticLLMPipeline(
@@ -189,9 +223,9 @@ void StaticLLMPipeline::finish_chat() {
 };
 
 void StaticLLMPipeline::prepare_for_new_conversation() {
-    fill_tensor(m_prefill_request.get_tensor("input_ids"), m_tokenizer.get_pad_token_id());
-    fill_tensor(m_prefill_request.get_tensor("position_ids"), 0u);
-    fill_tensor(m_prefill_request.get_tensor("attention_mask"), 0u);
+    // fill_tensor(m_prefill_request.get_tensor("input_ids"), m_tokenizer.get_pad_token_id());
+    // fill_tensor(m_prefill_request.get_tensor("position_ids"), 0u);
+    // fill_tensor(m_prefill_request.get_tensor("attention_mask"), 0u);
     fill_tensor(m_kvcache_request.get_tensor("attention_mask"), 0u);
     m_kvcache_desc.num_stored_tokens = 0u;
 }
@@ -201,6 +235,7 @@ DecodedResults StaticLLMPipeline::generate(
     OptionalGenerationConfig generation_config,
     StreamerVariant streamer
 ) {
+
     GenerationConfig config = (generation_config.has_value()) ? *generation_config : m_generation_config;
     if (std::holds_alternative<std::vector<std::string>>(inputs)) {
         OPENVINO_THROW("Currently only batch size=1 is supported");
@@ -226,14 +261,51 @@ DecodedResults StaticLLMPipeline::generate(
     return decoded_results;
 }
 
+typedef std::chrono::high_resolution_clock Time;
+typedef std::chrono::nanoseconds ns;
+
+inline double get_duration_ms_till_now(Time::time_point& startTime) {
+    return std::chrono::duration_cast<ns>(Time::now() - startTime).count() * 0.000001;
+};
+
+inline double get_duration_ms(Time::time_point& startTime, Time::time_point& endTime) {
+    return std::chrono::duration_cast<ns>(endTime - startTime).count() * 0.000001;
+};
+
+void copy_with_left_offset(const ov::Tensor& orig, ov::Tensor& padded) {
+    const auto orig_size = orig.get_size();
+    const auto padded_size = padded.get_size();
+    const auto kLeftOffset = padded_size - orig_size;
+    int64_t* orig_data = orig.data<int64_t>();
+    ov::float16* padded_data = padded.data<ov::float16>();
+    std::copy(orig_data, orig_data + orig_size, padded_data + kLeftOffset);
+}
+bool ends_with(const std::string& str, const std::string& suffix) {
+    // Check if the length of the suffix is greater than the string itself
+    if (suffix.size() > str.size()) return false;
+
+    // Use rfind to find the suffix at the end of the string
+    return str.rfind(suffix) == (str.size() - suffix.size());
+}
+
 EncodedResults StaticLLMPipeline::generate(
     const EncodedInputs& inputs,
     OptionalGenerationConfig generation_config,
     StreamerVariant streamer
 ) {
+    const auto& compiledModel = m_kvcache_request.get_compiled_model();
+
+    ov::element::Type layer_type = ov::element::f16;
+    
+    for (int j = 0; j < compiledModel.inputs().size() - 1; ++j) {
+        std::string input_name = compiledModel.inputs()[j].get_any_name();
+        ov::Tensor zero_tensor = ov::Tensor(layer_type, ov::Shape(compiledModel.inputs()[j].get_shape()));
+        m_kvcache_request.set_tensor(input_name, zero_tensor);
+    }
+
     ov::Tensor input_ids;
     ov::Tensor attention_mask;
-
+    
     if (auto data = std::get_if<ov::Tensor>(&inputs)) {
         input_ids = *data;
         attention_mask = ov::genai::utils::init_attention_mask(input_ids);
@@ -271,7 +343,7 @@ EncodedResults StaticLLMPipeline::generate(
     results.scores[0] = 0u;
     results.tokens.resize(1u);
 
-    // NB: Check if there is enough space in KV-cache to process input prompt
+    // NB: Check if input prompt less than maximum size
     auto prompt_len = input_ids.get_size();
     if (prompt_len > m_kvcache_desc.total_size) {
         OPENVINO_THROW("Currently static pipeline only process up to " + std::to_string(m_kvcache_desc.total_size) + " tokens");
@@ -279,68 +351,116 @@ EncodedResults StaticLLMPipeline::generate(
 
     // NB: From the "generate" perspective, every call is treated as start of new conversation,
     // but if continuation is needed, prompt contains information about the entire conversation.
-    prepare_for_new_conversation();
+    // prepare_for_new_conversation();
 
-    auto padded_input_ids = m_prefill_request.get_tensor("input_ids");
-    const size_t offset = padded_input_ids.get_size() - input_ids.get_size();
-    copy_with_offset(input_ids, offset, padded_input_ids);
+    auto start_time = Time::now();
 
-    auto padded_attention_mask = m_prefill_request.get_tensor("attention_mask");
-    fill_tensor(padded_attention_mask, 1u, offset);
+    // auto padded_attention_mask = ov::Tensor(ov::element::f16, ov::Shape{1, 32, 1023, 128});
+    auto padded_attention_mask = m_kvcache_request.get_tensor("attention_mask");
+    copy_with_left_offset(attention_mask, padded_attention_mask);
 
-    auto padded_position_ids = m_prefill_request.get_tensor("position_ids");
-    auto* padded_pos_data = padded_position_ids.data<int64_t>();
-    std::iota(padded_pos_data + (m_kvcache_desc.total_size - prompt_len + 1), padded_pos_data + padded_position_ids.get_size(), 0u);
+    ov::float16 new_token;
+    // NB: Prefill stage
+    ov::float16* input_ids_data = m_kvcache_request.get_tensor("input_ids").data<ov::float16>();
+    ov::float16* position_ids_data = m_kvcache_request.get_tensor("position_ids").data<ov::float16>();
+    ov::float16* attention_mask_data = m_kvcache_request.get_tensor("attention_mask").data<ov::float16>();
 
-    m_prefill_request.infer();
+    const auto kStartInputKVCacheLayers = 0u;
+    const auto kStartOutputKVCacheLayers = 1u;
 
-    // NB: Now there are prompt_len tokens in KV-cache
+    int64_t* orig_data = input_ids.data<int64_t>();
+    for (int i = 0; i < prompt_len; ++i) {
+        new_token = orig_data[m_kvcache_desc.total_size - prompt_len + i];
+        input_ids_data[0] = new_token;
+        position_ids_data[0] = i;
+        size_t attention_tmp_idx = i - 1;
+        if (i == 0) {
+            attention_tmp_idx = m_kvcache_desc.total_size - i - 1;
+        }
+        attention_mask_data[attention_tmp_idx] = 1u;
+
+        m_kvcache_request.infer();
+
+        for (int j = 0; j < compiledModel.outputs().size() - 1; ++j) {
+            // std::string input_name = compiledModel.inputs()[kStartInputKVCacheLayers + j].get_any_name();
+            std::string input_name;
+            std::string output_name = compiledModel.outputs()[kStartOutputKVCacheLayers + j].get_any_name();
+            auto kvcache_out_tensor = m_kvcache_request.get_tensor(output_name);
+            if (ends_with(output_name, "value")) {
+                input_name = output_name.replace(output_name.find("present"), 7, "past_key_values");
+                auto kvcache_tensor = m_kvcache_request.get_tensor(input_name);
+                // auto inplace_input_tensor = ov::Tensor(kvcache_out_tensor, ov::Coordinate({ 0, 0, 0, (unsigned long long)i }), ov::Coordinate({ 1, 32, 96, (unsigned long long)i+1}));
+                // copy_with_offset(kvcache_tensor, 0)
+                // inplace_input_tensor.copy_to(kvcache_tensor);
+                auto inplace_input_tensor = ov::Tensor(ov::element::f16, ov::Shape{1,32,96,1023});
+            } else {
+                input_name = output_name.replace(output_name.find("present"), 7, "past_key_values");
+                auto kvcache_tensor = m_kvcache_request.get_tensor(input_name);
+                // auto inplace_input_tensor = ov::Tensor(kvcache_out_tensor, ov::Coordinate({ 0, 0, (unsigned long long)i, 0 }), ov::Coordinate({ 1, 32, (unsigned long long)i+1, 96}));
+                // inplace_input_tensor.copy_to(kvcache_tensor);
+                auto inplace_input_tensor = ov::Tensor(ov::element::f16, ov::Shape{1,32,1023,96});
+            }
+
+            // auto inplace_input_tensor = ov::Tensor(kvcache_out_tensor, ov::Coordinate({ 0, 0, 1, 0 }), ov::Coordinate({ 1, 32, 1024, 128 }));
+            // auto kvcache_tensor = m_kvcache_request.get_tensor(input_name);
+            // inplace_input_tensor.copy_to(kvcache_tensor);
+        }
+    }
+
+    // Generation stage
     m_kvcache_desc.num_stored_tokens += prompt_len;
-    int64_t last_token = utils::argmax(m_prefill_request.get_tensor("logits"), 0);
+    ov::float16 last_token = utils::argmax(m_kvcache_request.get_tensor("logits"), 0);
     results.tokens[0].push_back(last_token);
     if (streamer_ptr && streamer_ptr->put(last_token)) {
         return results;
     }
 
-    padded_attention_mask.copy_to(m_kvcache_request.get_tensor("attention_mask"));
-
-    // Inputs: input_ids, attention_mask, position_ids, ...
-    // Outputs: logits, ...
-    const auto kStartInputKVCacheLayers = 3u;
-    const auto kStartOutputKVCacheLayers = 1u;
-
-    const auto& kvcache_compiled = m_kvcache_request.get_compiled_model();
-    for (int i = 0; i < kvcache_compiled.outputs().size() - 1; ++i) {
-        const auto& input_name = kvcache_compiled.inputs()[kStartInputKVCacheLayers + i].get_any_name();
-        const auto& output_name = kvcache_compiled.outputs()[kStartOutputKVCacheLayers + i].get_any_name();
-        auto kvcache_out_tensor = m_kvcache_request.get_tensor(output_name);
-        m_kvcache_request.set_tensor(input_name, kvcache_out_tensor);
-        auto prefill_tensor = m_prefill_request.get_tensor(output_name);
-        auto kvcache_tensor = m_kvcache_request.get_tensor(input_name);
-        prefill_tensor.copy_to(kvcache_tensor);
-    }
-
-    auto* input_ids_data = m_kvcache_request.get_tensor("input_ids").data<int64_t>();
-    auto* position_ids_data = m_kvcache_request.get_tensor("position_ids").data<int64_t>();
-    auto* attention_mask_data = m_kvcache_request.get_tensor("attention_mask").data<int64_t>();
-
+    // padded_attention_mask.copy_to(m_kvcache_request.get_tensor("attention_mask"));
+    auto first_token_time = Time::now();
     const size_t max_tokens = config.get_max_new_tokens(prompt_len);
-    for (int i = 0; i < max_tokens - 1; ++i) {
-        input_ids_data[0] = last_token;
-        position_ids_data[0] = m_kvcache_desc.num_stored_tokens;
-        attention_mask_data[m_kvcache_desc.total_size - m_kvcache_desc.num_stored_tokens - 1] = 1u;
+    int token_count = 0;
+    // for (int i = 0; i < max_tokens - 1; ++i) {
+    for (int i = prompt_len; i < max_tokens; ++i) {
+        input_ids_data[0] = (ov::float16)last_token;
+        position_ids_data[0] = (ov::float16)i;
+        attention_mask_data[i -1] = (ov::float16)1u;
 
         m_kvcache_request.infer();
-        m_kvcache_desc.num_stored_tokens += 1;
+
+        for (int j = 0; j < compiledModel.outputs().size() - 1; ++j) {
+            // std::string input_name = compiledModel.inputs()[kStartInputKVCacheLayers + j].get_any_name();
+            std::string input_name;
+            std::string output_name = compiledModel.outputs()[kStartOutputKVCacheLayers + j].get_any_name();
+            auto kvcache_out_tensor = m_kvcache_request.get_tensor(output_name);
+            if (ends_with(output_name, "value")) {
+                input_name = output_name.replace(output_name.find("present"), 7, "past_key_values");
+                auto kvcache_tensor = m_kvcache_request.get_tensor(input_name);
+                // auto inplace_input_tensor = ov::Tensor(kvcache_out_tensor, ov::Coordinate({ 0, 0, 0, (unsigned long long)i }), ov::Coordinate({ 1, 32, 96, (unsigned long long)i+1}));
+                // inplace_input_tensor.copy_to(kvcache_tensor);
+                auto inplace_input_tensor = ov::Tensor(ov::element::f16, ov::Shape{1,32,96,1023});
+            } else {
+                input_name = output_name.replace(output_name.find("present"), 7, "past_key_values");
+                auto kvcache_tensor = m_kvcache_request.get_tensor(input_name);
+                // auto inplace_input_tensor = ov::Tensor(kvcache_out_tensor, ov::Coordinate({ 0, 0, (unsigned long long)i, 0 }), ov::Coordinate({ 1, 32, (unsigned long long)i+1, 96}));
+                // inplace_input_tensor.copy_to(kvcache_tensor);
+                auto inplace_input_tensor = ov::Tensor(ov::element::f16, ov::Shape{1,32,1023,96});
+            }
+
+            // auto inplace_input_tensor = ov::Tensor(kvcache_out_tensor, ov::Coordinate({ 0, 0, 1, 0 }), ov::Coordinate({ 1, 32, 1024, 128 }));
+            // auto kvcache_tensor = m_kvcache_request.get_tensor(input_name);
+            // inplace_input_tensor.copy_to(kvcache_tensor);
+        }
 
         last_token = utils::argmax(m_kvcache_request.get_tensor("logits"), 0);
-        results.tokens[0].push_back(last_token);
+        results.tokens[0].push_back((int64_t)last_token);
+
+        token_count++;
 
         if (streamer_ptr && streamer_ptr->put(last_token)) {
             break;
         }
 
-        if (last_token == config.eos_token_id && !config.ignore_eos) {
+        if ((int64_t)last_token == m_generation_config.eos_token_id) {
             break;
         }
 
@@ -348,8 +468,36 @@ EncodedResults StaticLLMPipeline::generate(
         if (m_kvcache_desc.num_stored_tokens == m_kvcache_desc.total_size) {
             break;
         }
-
     }
+
+    auto end_time = Time::now();
+    std::cout << "Performance metrics: " << std::endl;
+    std::cout << "Generated tokens: " << token_count << std::endl;
+    std::cout << "First token generation time: " << get_duration_ms(start_time, first_token_time) << std::endl;
+    std::cout << "Generation average latency: " << get_duration_ms(start_time, end_time)/(token_count - 1) << std::endl;
+    std::cout << "token/s: " << (token_count - 1)/(get_duration_ms(start_time, end_time)/1000) << std::endl;
+    std::cout << "Generation time: " << get_duration_ms(start_time, end_time) << std::endl;
+
+    std::cout << "Tokens:\n";
+    for (const auto& token_vector : results.tokens) {
+        std::cout << "[";
+        for (size_t i = 0; i < token_vector.size(); ++i) {
+            std::cout << token_vector[i];
+            if (i != token_vector.size() - 1) {
+                std::cout << ", ";
+            }
+        }
+        std::cout << "]\n";
+    }
+
+    std::cout << "Scores:\n[";
+    for (size_t i = 0; i < results.scores.size(); ++i) {
+        std::cout << results.scores[i];
+        if (i != results.scores.size() - 1) {
+            std::cout << ", ";
+        }
+    }
+    std::cout << "]\n";
     return results;
 }
 
