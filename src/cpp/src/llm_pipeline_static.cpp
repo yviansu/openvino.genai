@@ -97,26 +97,15 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
     model->reshape(new_shapes);
 }
 
-template <typename T>
-using uniformDistribution = typename std::conditional<
-    std::is_floating_point<T>::value,
-    std::uniform_real_distribution<T>,
-    typename std::conditional<std::is_integral<T>::value, std::uniform_int_distribution<T>, void>::type>::type;
-
-template <typename T, typename T2>
-static inline void fill_random(ov::Tensor& tensor,
-                               T rand_min = std::numeric_limits<uint8_t>::min(),
-                               T rand_max = std::numeric_limits<uint8_t>::max()) {
-    std::mt19937 gen(0);
+static inline void fill_zero(ov::Tensor& tensor) {
     size_t tensor_size = tensor.get_size();
     if (0 == tensor_size) {
         throw std::runtime_error(
             "Models with dynamic shapes aren't supported. Input tensors must have specific shapes before inference");
     }
     ov::float16* data = tensor.data<ov::float16>();
-    uniformDistribution<T2> distribution(rand_min, rand_max);
     for (size_t i = 0; i < tensor_size; i++) {
-        data[i] = static_cast<ov::float16>(distribution(gen));
+        data[i] = 0;
     }
 }
 
@@ -209,9 +198,9 @@ void StaticLLMPipeline::finish_chat() {
 };
 
 void StaticLLMPipeline::prepare_for_new_conversation() {
-    // fill_tensor(m_prefill_request.get_tensor("input_ids"), m_tokenizer.get_pad_token_id());
-    // fill_tensor(m_prefill_request.get_tensor("position_ids"), 0u);
-    // fill_tensor(m_prefill_request.get_tensor("attention_mask"), 0u);
+    fill_tensor(m_prefill_request.get_tensor("input_ids"), m_tokenizer.get_pad_token_id());
+    fill_tensor(m_prefill_request.get_tensor("position_ids"), 0u);
+    fill_tensor(m_prefill_request.get_tensor("attention_mask"), 0u);
     fill_tensor(m_kvcache_request.get_tensor("attention_mask"), 0u);
     m_kvcache_desc.num_stored_tokens = 0u;
 }
@@ -277,7 +266,7 @@ EncodedResults StaticLLMPipeline::generate(
     //     m_kvcache_request.set_tensor(input_name, zero_tensor);
     // }
     for (const ov::Output<const ov::Node>& model_input : compiledModel.inputs()) {
-        fill_random<short, short>(m_kvcache_request.get_tensor(model_input));
+        fill_zero(m_kvcache_request.get_tensor(model_input));
     }
 
     auto startTime = Time::now();
@@ -289,11 +278,6 @@ EncodedResults StaticLLMPipeline::generate(
     size_t iteration = 0;
     startTime = Time::now();
     while ( iteration < 100) {
-        // for (int j = 0; j < compiledModel.inputs().size() - 1; ++j) {
-        //     std::string input_name = compiledModel.inputs()[j].get_any_name();
-        //     ov::Tensor zero_tensor = ov::Tensor(layer_type, ov::Shape(compiledModel.inputs()[j].get_shape()));
-        //     m_kvcache_request.set_tensor(input_name, zero_tensor);
-        // }
         m_kvcache_request.infer();
         ++iteration;
     }
