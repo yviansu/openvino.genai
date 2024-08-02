@@ -20,6 +20,13 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cctype>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <list>
+#include <random>
 
 // #include <openvino/pass/stateful_to_stateless.hpp>
 
