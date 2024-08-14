@@ -8,26 +8,30 @@
 #include "text_callback_streamer.hpp"
 #include "utils.hpp"
 
-#include <openvino/pass/stateful_to_stateless.hpp>
+#include <openvino/pass/serialize.hpp>
+#include <openvino/openvino.hpp>
+#include <filesystem>
+#include <fstream>
+#include <variant>
+#include <algorithm>
+#include <nlohmann/json.hpp>
+#include <chrono>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+#include <cctype>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <list>
+#include <random>
+
+// #include <openvino/pass/stateful_to_stateless.hpp>
 
 namespace {
-
-void align_u4_zp_constants(const std::shared_ptr<ov::Model>& model) {
-    for (auto op : model->get_ops()) {
-        if (ov::op::util::is_constant(op)) {
-            auto cst_op = std::dynamic_pointer_cast<ov::op::v0::Constant>(op);
-            const auto cst_op_out = cst_op->output(0);
-            if (cst_op_out.get_element_type() == ov::element::u4 && ov::shape_size(cst_op_out.get_shape()) == 1u) {
-                ov::Tensor cst_tensor(ov::element::u4, cst_op_out.get_shape());
-                *static_cast<uint8_t*>(cst_tensor.data()) = cst_op->get_vector<uint8_t>()[0] & 0x0f;
-                auto new_cst_op = std::make_shared<ov::op::v0::Constant>(cst_tensor);
-                for (auto target_input : cst_op_out.get_target_inputs()) {
-                    target_input.replace_source_output(new_cst_op);
-                }
-            }
-        }
-    }
-}
 
 std::shared_ptr<ov::Model> add_slices_to_kvcache_inputs(const std::shared_ptr<ov::Model>& model) {
     const auto kvcache_name_pattern = "past_key_values";
@@ -95,13 +99,13 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
 }
 
 void fill_tensor(ov::Tensor tensor, int64_t fill_val, size_t offset = 0u) {
-    int64_t* tensor_data = tensor.data<int64_t>();
-    std::fill(tensor_data + offset, tensor_data + tensor.get_size(), fill_val);
+    ov::float16* tensor_data = tensor.data<ov::float16>();
+    std::fill(tensor_data + offset, tensor_data + tensor.get_size(), (ov::float16)fill_val);
 }
 
 void copy_with_offset(const ov::Tensor& orig, const int32_t offset, ov::Tensor& padded) {
     int64_t* orig_data = orig.data<int64_t>();
-    int64_t* padded_data = padded.data<int64_t>();
+    ov::float16* padded_data = padded.data<ov::float16>();
     std::copy(orig_data, orig_data + orig.get_size(), padded_data + offset);
 }
 
@@ -145,45 +149,22 @@ StaticLLMPipeline::StaticLLMPipeline(
     const ov::AnyMap& config
 ) : LLMPipelineImplBase(tokenizer,
                         utils::from_config_json_if_exists(path)) {
-    /* NB: Static LLM pipeline consists of two models,
-       first to process the input prompt (prefill), second to use in generation loop (kvcache)
-
-       Initialization assumes multiple steps:
-       1) Read the template model - this will be kvcache model
-       2) Expose KV-cache input and output layers from kvcache model
-       3) Clone the model - this will be prefill
-       3) Reshape both models to static shape
-       4) Add slices to KV-cache inputs for kvcache model, this will make input and output KV-cache
-          layers to have the same shape and allow outputs writes directly to inputs for the next iteration.
-       5) Compile both models
-       6) Initialize input tensors for kvcache and prefill models
-    */
     ov::Core core;
     // (1) Read the template model - this will be kvcache model
-    m_kvcache_model = core.read_model(path / "openvino_model.xml");
-    // (2) Expose KV-cache input and output layers from kvcache model
-    ov::pass::StatefulToStateless().run_on_model(m_kvcache_model);
-    align_u4_zp_constants(m_kvcache_model);
-    // (3) Clone the model - this will be prefill
-    m_prefill_model = m_kvcache_model->clone();
-    m_prefill_model->set_friendly_name(m_kvcache_model->get_friendly_name() + "_prefill");
+    std::ifstream modelStream("C:\\WorkSpace\\Yihan\\models\\Phi-3\\ovmergev6\\concat_merge_full.blob", std::ios_base::binary | std::ios_base::in);
+    if (!modelStream.is_open()) {
+        std::cout << "Cannot open kvcache blob file" << std::endl;
+    }
+    std::cout << "Use kvcache blob file" << std::endl;
+    ov::AnyMap latency{{ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY}};
+    m_kvcache_request = core.import_model(modelStream, device, latency).create_infer_request();
+    std::cout << "kvcache blob file imported on " << device << std::endl;
+    modelStream.close();
+
     // (4) Reshape both models to static shape
     m_kvcache_desc = KVCacheDesc { 1024u, 0u };
     const uint32_t max_prompt_size = m_kvcache_desc.total_size;
     const uint32_t max_kvcache_size = m_kvcache_desc.total_size;
-    reshape_to_static(m_prefill_model, max_prompt_size, max_kvcache_size);
-    reshape_to_static(m_kvcache_model, 1u, max_kvcache_size);
-    // (5) Add slices to kvcache model
-    m_kvcache_model = add_slices_to_kvcache_inputs(m_kvcache_model);
-    // (6) Compile both model
-    m_prefill_request = core.compile_model(
-        m_prefill_model, device, extract_config_or_default(config, "PREFILL_CONFIG")
-    ).create_infer_request();
-    m_kvcache_request = core.compile_model(
-        m_kvcache_model, device, extract_config_or_default(config, "GENERATE_CONFIG")
-    ).create_infer_request();
-    // (7) Initialize tensors
-    prepare_for_new_conversation();
 };
 
 StaticLLMPipeline::StaticLLMPipeline(
@@ -243,11 +224,31 @@ DecodedResults StaticLLMPipeline::generate(
     return decoded_results;
 }
 
+typedef std::chrono::high_resolution_clock Time;
+typedef std::chrono::nanoseconds ns;
+
+inline double get_duration_ms_till_now(Time::time_point& startTime) {
+    return std::chrono::duration_cast<ns>(Time::now() - startTime).count() * 0.000001;
+};
+
+inline double get_duration_ms(Time::time_point& startTime, Time::time_point& endTime) {
+    return std::chrono::duration_cast<ns>(endTime - startTime).count() * 0.000001;
+};
+
 EncodedResults StaticLLMPipeline::generate(
     const EncodedInputs& inputs,
     OptionalGenerationConfig generation_config,
     StreamerVariant streamer
 ) {
+    const auto& compiledModel = m_kvcache_request.get_compiled_model();
+
+    ov::element::Type layer_type = ov::element::f16;
+    for (const ov::Output<const ov::Node>& model_input : compiledModel.inputs()) {
+        if (model_input.get_any_name().rfind("past_key", 0) == 0) {
+            fill_tensor(m_kvcache_request.get_tensor(model_input), 0u);
+        }
+    }
+
     ov::Tensor input_ids;
     ov::Tensor attention_mask;
 
@@ -294,70 +295,94 @@ EncodedResults StaticLLMPipeline::generate(
         OPENVINO_THROW("Currently static pipeline only process up to " + std::to_string(m_kvcache_desc.total_size) + " tokens");
     }
 
-    // NB: From the "generate" perspective, every call is treated as start of new conversation,
-    // but if continuation is needed, prompt contains information about the entire conversation.
-    prepare_for_new_conversation();
+    auto start_time = Time::now();
+    std::vector<ov::Tensor> past_value_cache, past_key_cache, present_value, present_key;
 
-    auto padded_input_ids = m_prefill_request.get_tensor("input_ids");
-    const size_t offset = padded_input_ids.get_size() - input_ids.get_size();
-    copy_with_offset(input_ids, offset, padded_input_ids);
+    for (int idx = 0; idx < 32; idx++)
+    {
+        std::string value_cache_name = "past_key_values." + std::to_string(idx) + ".value";
+        std::string key_cache_name = "past_key_values." + std::to_string(idx) + ".key";
+        std::string present_value_name = "present." + std::to_string(idx) + ".value";
+        std::string present_key_name = "present." + std::to_string(idx) + ".key";
 
-    auto padded_attention_mask = m_prefill_request.get_tensor("attention_mask");
-    fill_tensor(padded_attention_mask, 1u, offset);
+        past_value_cache.push_back(m_kvcache_request.get_tensor(value_cache_name));
+        past_key_cache.push_back(m_kvcache_request.get_tensor(key_cache_name));
+        present_value.push_back(m_kvcache_request.get_tensor(present_value_name));
+        present_key.push_back(m_kvcache_request.get_tensor(present_key_name));
+    }
 
-    auto padded_position_ids = m_prefill_request.get_tensor("position_ids");
-    auto* padded_pos_data = padded_position_ids.data<int64_t>();
-    std::iota(padded_pos_data + (m_kvcache_desc.total_size - prompt_len + 1), padded_pos_data + padded_position_ids.get_size(), 0u);
+    // NB: Prefill stage
+    std::cout << "Prefill stage: " << std::endl;
+    int64_t new_token;
+    int64_t* input_ids_data = m_kvcache_request.get_tensor("input_ids").data<int64_t>();
+    int64_t* position_ids_data = m_kvcache_request.get_tensor("position_ids").data<int64_t>();
+    int64_t* attention_mask_data = m_kvcache_request.get_tensor("attention_mask").data<int64_t>();
 
-    m_prefill_request.infer();
+    int64_t* orig_data = input_ids.data<int64_t>();
+    std::cout << "prompt_len: " << prompt_len << std::endl;
+    std::cout << "input_ids: " << input_ids.get_shape() << std::endl;
 
-    // NB: Now there are prompt_len tokens in KV-cache
+    for (unsigned long long i = 0; i < prompt_len; ++i) {
+        // new_token = orig_data[m_kvcache_desc.total_size - prompt_len + i];
+        new_token = orig_data[i];
+        input_ids_data[0] = new_token;
+        position_ids_data[0] = i;
+        // optimised kvcache
+        size_t attention_tmp_idx = i - 1;
+        if (i == 0) {
+            attention_tmp_idx = m_kvcache_desc.total_size - i - 1;
+        }
+        // // original kvcache
+        // attention_tmp_idx = m_kvcache_desc.total_size - i - 1;
+        attention_mask_data[attention_tmp_idx] = 1u;
+
+        m_kvcache_request.infer();
+        
+        for (int layer = 0; layer < 32; layer++)
+        {
+            present_key[layer].copy_to(ov::Tensor(past_key_cache[layer], {0, 0, i, 0}, {1, 32, i + 1, 96}));
+            present_value[layer].copy_to(ov::Tensor(past_value_cache[layer], {0, 0, 0, i}, {1, 32, 96, i + 1}));
+        }
+    }
+
+    // Generation stage
+    std::cout << "Generation stage: " << std::endl;
     m_kvcache_desc.num_stored_tokens += prompt_len;
-    int64_t last_token = utils::argmax(m_prefill_request.get_tensor("logits"), 0);
+    ov::float16 last_token = utils::argmax(m_kvcache_request.get_tensor("logits"), 0);
     results.tokens[0].push_back(last_token);
     if (streamer_ptr && streamer_ptr->put(last_token)) {
         return results;
     }
 
-    padded_attention_mask.copy_to(m_kvcache_request.get_tensor("attention_mask"));
-
-    // Inputs: input_ids, attention_mask, position_ids, ...
-    // Outputs: logits, ...
-    const auto kStartInputKVCacheLayers = 3u;
-    const auto kStartOutputKVCacheLayers = 1u;
-
-    const auto& kvcache_compiled = m_kvcache_request.get_compiled_model();
-    for (int i = 0; i < kvcache_compiled.outputs().size() - 1; ++i) {
-        const auto& input_name = kvcache_compiled.inputs()[kStartInputKVCacheLayers + i].get_any_name();
-        const auto& output_name = kvcache_compiled.outputs()[kStartOutputKVCacheLayers + i].get_any_name();
-        auto kvcache_out_tensor = m_kvcache_request.get_tensor(output_name);
-        m_kvcache_request.set_tensor(input_name, kvcache_out_tensor);
-        auto prefill_tensor = m_prefill_request.get_tensor(output_name);
-        auto kvcache_tensor = m_kvcache_request.get_tensor(input_name);
-        prefill_tensor.copy_to(kvcache_tensor);
-    }
-
-    auto* input_ids_data = m_kvcache_request.get_tensor("input_ids").data<int64_t>();
-    auto* position_ids_data = m_kvcache_request.get_tensor("position_ids").data<int64_t>();
-    auto* attention_mask_data = m_kvcache_request.get_tensor("attention_mask").data<int64_t>();
-
+    auto first_token_time = Time::now();
     const size_t max_tokens = config.get_max_new_tokens(prompt_len);
-    for (int i = 0; i < max_tokens - 1; ++i) {
-        input_ids_data[0] = last_token;
-        position_ids_data[0] = m_kvcache_desc.num_stored_tokens;
-        attention_mask_data[m_kvcache_desc.total_size - m_kvcache_desc.num_stored_tokens - 1] = 1u;
+
+    for (unsigned long long i = prompt_len; i < m_kvcache_desc.total_size - 1; ++i) {
+        input_ids_data[0] = (int64_t)last_token;
+        position_ids_data[0] = (int64_t)i;
+        // optimised kvcache
+        size_t attention_tmp_idx = i - 1;
+        // // original kvcache
+        // attention_tmp_idx = m_kvcache_desc.total_size - i - 1;
+        attention_mask_data[attention_tmp_idx] = (int64_t)1u;
 
         m_kvcache_request.infer();
-        m_kvcache_desc.num_stored_tokens += 1;
 
+        for (int layer = 0; layer < 32; layer++)
+        {
+            present_key[layer].copy_to(ov::Tensor(past_key_cache[layer], {0, 0, i, 0}, {1, 32, i + 1, 96}));
+            present_value[layer].copy_to(ov::Tensor(past_value_cache[layer], {0, 0, 0, i}, {1, 32, 96, i + 1}));
+        }
+
+        m_kvcache_desc.num_stored_tokens += 1;
         last_token = utils::argmax(m_kvcache_request.get_tensor("logits"), 0);
-        results.tokens[0].push_back(last_token);
+        results.tokens[0].push_back((int64_t)last_token);
 
         if (streamer_ptr && streamer_ptr->put(last_token)) {
             break;
         }
 
-        if (last_token == config.eos_token_id && !config.ignore_eos) {
+        if ((int64_t)last_token == m_generation_config.eos_token_id) {
             break;
         }
 
@@ -365,7 +390,30 @@ EncodedResults StaticLLMPipeline::generate(
         if (m_kvcache_desc.num_stored_tokens == m_kvcache_desc.total_size) {
             break;
         }
+    }
 
+    std::cout << "Result stage: " << std::endl;
+
+    int token_count = results.tokens[0].size();
+    
+    auto end_time = Time::now();
+    std::cout << "Performance metrics: " << std::endl;
+    std::cout << "Generated tokens: " << token_count << std::endl;
+    std::cout << "First token generation time: " << get_duration_ms(start_time, first_token_time) << std::endl;
+    std::cout << "Generation average latency: " << get_duration_ms(first_token_time, end_time)/(token_count - 1) << std::endl;
+    std::cout << "token/s: " << (token_count - 1)/(get_duration_ms(first_token_time, end_time)/1000) << std::endl;
+    std::cout << "Generation time: " << get_duration_ms(start_time, end_time) << std::endl;
+
+    std::cout << "Tokens:\n";
+    for (const auto& token_vector : results.tokens) {
+        std::cout << "[";
+        for (size_t i = 0; i < token_vector.size(); ++i) {
+            std::cout << token_vector[i];
+            if (i != token_vector.size() - 1) {
+                std::cout << ", ";
+            }
+        }
+        std::cout << "]\n";
     }
     return results;
 }
